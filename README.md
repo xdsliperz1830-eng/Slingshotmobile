@@ -5,7 +5,10 @@ step, no network calls — just open `index.html` in any modern browser and play
 
 ## Play
 
-Open `index.html` directly on your phone (iOS Safari / Android Chrome) or on
+Live version (auto-deployed from `main`):
+**https://xdsliperz1830-eng.github.io/Slingshotmobile/**
+
+Or open `index.html` directly on your phone (iOS Safari / Android Chrome) or on
 desktop. Tap **Play**, then **drag back and release** to toss a horseshoe:
 
 - The **length** of your drag sets the **power** (shown on the power meter).
