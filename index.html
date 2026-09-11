@@ -81,9 +81,19 @@
     ringerRadius: 0.05,      // encircles the stake -> 3 pts
     leanerRadius: 0.085,     // touching the stake   -> 2 pts
     closeRadius:  0.16,      // ~one shoe-width away  -> 1 pt
-    aimMaxDrag: 170,         // px drag length that equals full power
+    aimMaxDrag: 170,         // px drag length = full power, at a 390px baseline
+    aimDragBaseline: 390,    // screen size the drag length above was tuned for
+    minForwardAim: 0.15,     // floor so a sideways drag still travels a little
     spinSpeed: 0.35,         // horseshoe spin rate in flight
+    // Wind: a mild lateral drift, re-rolled each round, shown in the HUD.
+    windMax: 0.00012,        // max lateral acceleration per frame
+    // Aim assist: dotted preview of the predicted arc while dragging.
+    showTrajectory: true,
+    trajectoryDots: 14,      // how many dots to draw along the predicted arc
+    sound: true,             // master switch for the WebAudio effects
+    haptics: true,           // navigator.vibrate feedback on landing
   };
+
 
   /* ============================================================
    * 2. STATE
@@ -96,20 +106,24 @@
     // session scores
     bestScore: 0,
     totalScore: 0,
+    round: 0,          // how many rounds played this session
     // current round
     roundScore: 0,
     throwsLeft: CONFIG.throwsPerRound,
     landedShoes: [],   // shoes already at rest this round {d, x, spin, score}
+    wind: 0,           // lateral acceleration for this round (-1..1 scaled)
     // active shoe in flight (or null)
     shoe: null,
     // input / aiming
     aiming: false,
     aimStart: null,    // {x, y} pointer down position
     aimCur: null,      // {x, y} current pointer position
+    preview: null,     // predicted arc while aiming {pts:[{x,y}], land:{x,y,scale}}
     // transient FX
     puffs: [],         // dust puffs {x, y, t, life}
     popups: [],        // score popups {x, y, text, t, life, color}
     flash: 0,          // ringer flash intensity 0..1
+    muted: false,      // sound toggle (tap the speaker in the HUD)
     // buttons (rebuilt each layout) -> {x,y,w,h,label,action}
     buttons: [],
   };
@@ -130,6 +144,7 @@
     farHalfW: 0,    // half-width of pit at the far end
     nearHalfW: 0,   // half-width of pit at the near end
     stakeScreen: { x: 0, y: 0, scale: 1 },
+    aimMaxDrag: CONFIG.aimMaxDrag, // px drag for full power, set in resize()
   };
 
   function resize() {
@@ -142,12 +157,23 @@
     canvas.style.height = H + "px";
     ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
 
-    // Pit occupies the central band of the screen in portrait.
+    // Portrait is the target, but landscape gets a shallower, narrower pit so
+    // the stake stays on screen and the throwing line stays reachable.
+    const landscape = W > H;
     view.centerX = W / 2;
-    view.pitTopY = H * 0.22;
-    view.pitBotY = H * 0.82;
-    view.farHalfW = Math.min(W, 520) * 0.16;
-    view.nearHalfW = Math.min(W, 520) * 0.46;
+    view.pitTopY = H * (landscape ? 0.16 : 0.22);
+    view.pitBotY = H * (landscape ? 0.88 : 0.82);
+    // Cap the pit width against the SHORTER axis so landscape doesn't stretch it.
+    const spanW = Math.min(W, landscape ? H * 1.1 : 520, 520);
+    view.farHalfW = spanW * 0.16;
+    view.nearHalfW = spanW * 0.46;
+
+    // Full-power drag length scales with screen size so the throw feels the
+    // same on a small phone and a tablet (tuned at a 390px baseline).
+    view.aimMaxDrag = clamp(
+      CONFIG.aimMaxDrag * (Math.min(W, H) / CONFIG.aimDragBaseline),
+      110, 300
+    );
 
     const s = fieldToScreen(CONFIG.stakeDistance, 0, 0);
     view.stakeScreen = s;
@@ -171,6 +197,102 @@
   }
 
   /* ============================================================
+   * 3b. SOUND — tiny WebAudio synth, no asset files
+   * ============================================================ */
+
+  const sfx = (function () {
+    let ac = null;          // created lazily inside a user gesture (iOS rule)
+    let noiseBuf = null;
+
+    function on() { return CONFIG.sound && !state.muted && ac; }
+
+    // Must be called from a touch/click handler or iOS keeps audio suspended.
+    function unlock() {
+      if (!CONFIG.sound) return;
+      try {
+        if (!ac) {
+          const AC = window.AudioContext || window.webkitAudioContext;
+          if (!AC) return;
+          ac = new AC();
+        }
+        if (ac.state === "suspended") ac.resume();
+      } catch (e) { ac = null; }
+    }
+
+    // One second of white noise, reused by the whoosh and thud.
+    function noise() {
+      if (!noiseBuf) {
+        const n = Math.floor(ac.sampleRate * 0.5);
+        noiseBuf = ac.createBuffer(1, n, ac.sampleRate);
+        const ch = noiseBuf.getChannelData(0);
+        for (let i = 0; i < n; i++) ch[i] = Math.random() * 2 - 1;
+      }
+      const src = ac.createBufferSource();
+      src.buffer = noiseBuf;
+      return src;
+    }
+
+    // Short decaying tone. type/freq/duration shape the character.
+    function tone(type, freq, dur, gain, freqEnd) {
+      const o = ac.createOscillator();
+      const g = ac.createGain();
+      o.type = type;
+      o.frequency.setValueAtTime(freq, ac.currentTime);
+      if (freqEnd) o.frequency.exponentialRampToValueAtTime(freqEnd, ac.currentTime + dur);
+      g.gain.setValueAtTime(gain, ac.currentTime);
+      g.gain.exponentialRampToValueAtTime(0.0001, ac.currentTime + dur);
+      o.connect(g); g.connect(ac.destination);
+      o.start(); o.stop(ac.currentTime + dur);
+    }
+
+    return {
+      unlock: unlock,
+      // Air rushing past the shoe as it leaves your hand.
+      whoosh: function (power) {
+        if (!on()) return;
+        const src = noise();
+        const bp = ac.createBiquadFilter();
+        bp.type = "bandpass";
+        bp.frequency.setValueAtTime(400 + power * 700, ac.currentTime);
+        bp.Q.value = 1.2;
+        const g = ac.createGain();
+        g.gain.setValueAtTime(0.0001, ac.currentTime);
+        g.gain.exponentialRampToValueAtTime(0.14 * (0.4 + power), ac.currentTime + 0.06);
+        g.gain.exponentialRampToValueAtTime(0.0001, ac.currentTime + 0.3);
+        src.connect(bp); bp.connect(g); g.connect(ac.destination);
+        src.start(); src.stop(ac.currentTime + 0.32);
+      },
+      // Dull landing in the sand.
+      thud: function () {
+        if (!on()) return;
+        tone("sine", 130, 0.18, 0.25, 60);
+        const src = noise();
+        const lp = ac.createBiquadFilter();
+        lp.type = "lowpass";
+        lp.frequency.value = 900;
+        const g = ac.createGain();
+        g.gain.setValueAtTime(0.12, ac.currentTime);
+        g.gain.exponentialRampToValueAtTime(0.0001, ac.currentTime + 0.16);
+        src.connect(lp); lp.connect(g); g.connect(ac.destination);
+        src.start(); src.stop(ac.currentTime + 0.18);
+      },
+      // Metallic ring when the shoe catches the stake.
+      clink: function () {
+        if (!on()) return;
+        tone("triangle", 1850, 0.5, 0.18);
+        tone("triangle", 2470, 0.42, 0.12);
+        tone("sine", 3300, 0.3, 0.07);
+      },
+    };
+  })();
+
+  // Short vibration on supported devices; silently ignored elsewhere (iOS).
+  function buzz(pattern) {
+    if (!CONFIG.haptics) return;
+    try { if (navigator.vibrate) navigator.vibrate(pattern); } catch (e) {}
+  }
+
+  /* ============================================================
    * 4. INPUT HANDLING
    * ============================================================ */
 
@@ -189,6 +311,7 @@
 
   function onDown(e) {
     e.preventDefault();
+    sfx.unlock();   // first touch is our chance to start audio on iOS
     const p = pointerPos(e);
 
     // Buttons take priority on every screen.
@@ -229,71 +352,108 @@
   canvas.addEventListener("contextmenu", (e) => e.preventDefault());
   document.addEventListener("gesturestart", (e) => e.preventDefault());
 
-  // Translate the aim drag into a launched horseshoe.
-  function launchFromDrag() {
-    const a = state.aimStart, c = state.aimCur;
-    if (!a || !c) return;
-    // Drag vector: pulling DOWN/BACK (toward the player) builds power and
-    // throws the shoe FORWARD (up the screen). Sideways drag aims laterally.
+  // Read the current drag as an aim: power plus a direction.
+  // Returns null for a drag too short to count as a throw.
+  // The shoe flies OPPOSITE the drag (slingshot): pull back/down to throw
+  // forward/up, and pull to one side to aim the other way.
+  function aimFromDrag(a, c) {
+    if (!a || !c) return null;
     const dx = c.x - a.x;
     const dy = c.y - a.y;
     const dragLen = Math.hypot(dx, dy);
-    if (dragLen < 12) return; // ignore tiny taps
+    if (dragLen < 12) return null; // ignore tiny taps
 
-    const power = clamp(dragLen / CONFIG.aimMaxDrag, 0.12, CONFIG.maxPower);
-    // Forward speed comes from how far back you pulled (vertical component).
-    const back = Math.max(0, dy); // dragging downward = pulling back
-    const pullPower = clamp(Math.max(dragLen, back) / CONFIG.aimMaxDrag, 0.12, CONFIG.maxPower);
+    const power = clamp(dragLen / view.aimMaxDrag, 0.12, CONFIG.maxPower);
+    // Unit vector pointing where the shoe will go (opposite the drag).
+    const ux = -dx / dragLen;
+    const uy = -dy / dragLen;
+    // How much of the aim points up the pit. Screen y grows downward, so an
+    // upward aim has uy < 0. Floor it so a sideways drag still goes somewhere
+    // instead of launching at full forward speed.
+    const forward = Math.max(CONFIG.minForwardAim, -uy);
+    return { power: power, forward: forward, lateral: ux, dragLen: dragLen };
+  }
 
-    const vForward = pullPower * CONFIG.powerToSpeed * 0.016;
-    const vLateral = (-dx / CONFIG.aimMaxDrag) * CONFIG.lateralFactor * 0.016;
-    const vUp = pullPower * CONFIG.loftFactor * 0.5;
-
-    state.shoe = {
-      d: 0.02,            // forward distance
-      x: 0,               // lateral
-      z: 0.02,            // height
-      vd: vForward,
-      vx: vLateral,
-      vz: vUp,
+  // Build a shoe (not yet attached to state) from an aim.
+  function makeShoe(aim) {
+    const drive = aim.power * aim.forward;
+    return {
+      d: 0.02,                                   // forward distance
+      x: 0,                                      // lateral offset
+      z: 0.02,                                   // height above the sand
+      vd: drive * CONFIG.powerToSpeed * 0.016,
+      vx: aim.power * aim.lateral * CONFIG.lateralFactor * 0.016,
+      vz: drive * CONFIG.loftFactor * 0.5,
       spin: 0,
-      vspin: CONFIG.spinSpeed * (0.8 + power),
+      vspin: CONFIG.spinSpeed * (0.8 + aim.power),
       landed: false,
     };
+  }
+
+  // Translate the aim drag into a launched horseshoe.
+  function launchFromDrag() {
+    const aim = aimFromDrag(state.aimStart, state.aimCur);
     state.aimStart = state.aimCur = null;
+    state.preview = null;
+    if (!aim) return;
+    state.shoe = makeShoe(aim);
+    sfx.whoosh(aim.power);
   }
 
   /* ============================================================
    * 5. PHYSICS / UPDATE
    * ============================================================ */
 
+  /* Advance one shoe by one step. This is the SINGLE source of truth for
+   * flight: both the live throw and the dotted aim preview call it, so the
+   * preview can never drift from what actually happens. Returns true once the
+   * shoe has come to rest. */
+  function stepShoe(s, dt, wind) {
+    s.d += s.vd * dt;
+    s.x += s.vx * dt;
+    s.vx += wind * dt;                 // wind nudges it sideways over the flight
+    s.z += s.vz * dt * 0.06;
+    s.vz -= CONFIG.gravity * dt * 0.06;
+    s.spin += s.vspin * dt;
+    // Down on the sand, or sailed past the back of the pit.
+    return (s.z <= 0 && s.vz < 0) || s.d > 1.35;
+  }
+
+  // Run a throw forward in a scratch copy to predict where it lands.
+  function predictPath(aim) {
+    const s = makeShoe(aim);
+    const pts = [];
+    for (let i = 0; i < 600; i++) {
+      const done = stepShoe(s, 1, state.wind);
+      pts.push({ d: s.d, x: s.x, z: Math.max(0, s.z) });
+      if (done) break;
+    }
+    return { pts: pts, land: { d: s.d, x: s.x } };
+  }
+
   function update(dt) {
     // Advance the in-flight horseshoe with a simple gravity arc.
     const s = state.shoe;
     if (s && !s.landed) {
-      s.d += s.vd * dt;
-      s.x += s.vx * dt;
-      s.z += s.vz * dt * 0.06;
-      s.vz -= CONFIG.gravity * dt * 0.06;
-      s.spin += s.vspin * dt;
-
-      // Land when it drops back to the ground.
-      if (s.z <= 0 && s.vz < 0) {
-        s.z = 0;
-        s.landed = true;
-        landShoe(s);
-      }
-      // Safety: if it flies off the top, treat as a miss landing.
-      if (s.d > 1.35) {
+      if (stepShoe(s, dt, state.wind)) {
         s.z = 0;
         s.landed = true;
         landShoe(s);
       }
     }
 
-    // Update dust puffs.
+    // Keep the aim preview in sync with the current drag.
+    if (state.aiming && CONFIG.showTrajectory) {
+      const aim = aimFromDrag(state.aimStart, state.aimCur);
+      state.preview = aim ? predictPath(aim) : null;
+    }
+
+    // Update dust puffs (drift + fade). Physics lives here, not in render.
     for (let i = state.puffs.length - 1; i >= 0; i--) {
       const p = state.puffs[i];
+      p.x += p.vx * dt;
+      p.y += p.vy * dt;
+      p.vy += 0.04 * dt;
       p.t += dt;
       if (p.t >= p.life) state.puffs.splice(i, 1);
     }
@@ -314,10 +474,15 @@
     if (dist <= CONFIG.ringerRadius) {
       pts = 3; label = "RINGER! +3"; color = COLORS.flash;
       state.flash = 1;
+      sfx.clink(); buzz([28, 45, 28]);
     } else if (dist <= CONFIG.leanerRadius) {
       pts = 2; label = "LEANER +2"; color = "#ffd76a";
+      sfx.clink(); buzz(24);
     } else if (dist <= CONFIG.closeRadius) {
       pts = 1; label = "CLOSE +1"; color = "#bfe6a0";
+      sfx.thud(); buzz(14);
+    } else {
+      sfx.thud(); buzz(10);
     }
 
     s.score = pts;
@@ -369,6 +534,8 @@
 
   function render() {
     ctx.clearRect(0, 0, W, H);
+    // Buttons are re-registered by whatever draws them this frame.
+    state.buttons = [];
     drawBackground();
 
     if (state.screen === SCREEN.START) {
@@ -484,9 +651,12 @@
   }
 
   // Draw a single horseshoe (U-shape) centered at (x,y) with given scale+rotation.
-  function drawHorseshoe(x, y, scale, rot, lifted) {
+  // `squash` flattens it vertically in screen space so a shoe lying on the sand
+  // reads as being on the ground plane rather than facing the camera.
+  function drawHorseshoe(x, y, scale, rot, squash) {
     ctx.save();
     ctx.translate(x, y);
+    ctx.scale(1, squash == null ? 1 : squash);
     ctx.rotate(rot);
     ctx.scale(scale, scale);
 
@@ -535,7 +705,7 @@
       ctx.beginPath();
       ctx.ellipse(sc.x, sc.y + 4 * sc.scale, 16 * sc.scale, 6 * sc.scale, 0, 0, Math.PI * 2);
       ctx.fill();
-      drawHorseshoe(sc.x, sc.y, sc.scale, sh.spin, false);
+      drawHorseshoe(sc.x, sc.y, sc.scale, sh.spin, 0.45);
     }
   }
 
@@ -550,15 +720,12 @@
     ctx.beginPath();
     ctx.ellipse(gsc.x, gsc.y + 3, 15 * gsc.scale * shadowScale, 6 * gsc.scale * shadowScale, 0, 0, Math.PI * 2);
     ctx.fill();
-    drawHorseshoe(sc.x, sc.y, sc.scale * 1.05, s.spin, true);
+    // Flatter near the sand, more face-on at the top of the arc.
+    drawHorseshoe(sc.x, sc.y, sc.scale * 1.05, s.spin, clamp(0.45 + s.z * 3, 0.45, 0.95));
   }
 
   function drawPuffs() {
     for (const p of state.puffs) {
-      // advance puff drift
-      p.x += p.vx;
-      p.y += p.vy;
-      p.vy += 0.04;
       const k = 1 - p.t / p.life;
       ctx.globalAlpha = k * 0.8;
       ctx.fillStyle = COLORS.dust;
@@ -569,13 +736,43 @@
     ctx.globalAlpha = 1;
   }
 
+  // Dotted preview of the predicted arc plus a landing marker on the sand.
+  // Drawn from the same physics the throw uses, so it never lies.
+  function drawTrajectory() {
+    const pv = state.preview;
+    if (!pv || !pv.pts.length) return;
+    ctx.save();
+    // Sample evenly along the path so dot spacing reads as speed.
+    const n = CONFIG.trajectoryDots;
+    for (let i = 1; i <= n; i++) {
+      const p = pv.pts[Math.floor((i / n) * (pv.pts.length - 1))];
+      if (!p) continue;
+      const sc = fieldToScreen(p.d, p.x, p.z);
+      ctx.globalAlpha = 0.18 + 0.5 * (1 - i / n);
+      ctx.fillStyle = COLORS.aimArrow;
+      ctx.beginPath();
+      ctx.arc(sc.x, sc.y, Math.max(1.5, 3.2 * sc.scale), 0, Math.PI * 2);
+      ctx.fill();
+    }
+    // Predicted landing spot.
+    const l = fieldToScreen(pv.land.d, pv.land.x, 0);
+    ctx.globalAlpha = 0.85;
+    ctx.strokeStyle = COLORS.aimArrow;
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.ellipse(l.x, l.y, 14 * l.scale, 6 * l.scale, 0, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.restore();
+  }
+
   // Live aim arrow + power meter while dragging.
   function drawAim() {
     if (!state.aiming || !state.aimStart || !state.aimCur) return;
+    drawTrajectory();
     const a = state.aimStart, c = state.aimCur;
     const dx = c.x - a.x, dy = c.y - a.y;
     const len = Math.hypot(dx, dy);
-    const power = clamp(len / CONFIG.aimMaxDrag, 0, 1);
+    const power = clamp(len / view.aimMaxDrag, 0, 1);
 
     // Aim line points OPPOSITE the drag (slingshot feel): forward = -drag.
     const ax = a.x - dx, ay = a.y - dy;
@@ -624,7 +821,7 @@
     ctx.restore();
   }
 
-  // Top HUD: round score, throws left, totals.
+  // Top HUD: round score, throws left, totals, wind, and a mute toggle.
   function drawHUD() {
     ctx.save();
     ctx.fillStyle = COLORS.panel;
@@ -633,14 +830,19 @@
     ctx.fillStyle = COLORS.textLight;
     ctx.textAlign = "left";
     ctx.font = "bold 18px sans-serif";
-    ctx.fillText("Round: " + state.roundScore, 24, 33);
+    ctx.fillText("Score: " + state.roundScore, 24, 33);
     ctx.font = "13px sans-serif";
-    ctx.fillText("Best: " + state.bestScore + "   Total: " + state.totalScore, 24, 51);
+    ctx.fillText("Round " + state.round + "   Best: " + state.bestScore +
+                 "   Total: " + state.totalScore, 24, 51);
 
-    // throws remaining as little shoe pips
+    // Throws remaining, with the wind readout underneath.
     ctx.textAlign = "right";
     ctx.font = "bold 14px sans-serif";
-    ctx.fillText("Throws left: " + state.throwsLeft, W - 24, 33);
+    ctx.fillText("Throws: " + state.throwsLeft, W - 52, 33);
+    drawWind(W - 52, 46);
+
+    // Mute toggle lives in the HUD corner and is registered as a button.
+    drawMuteButton();
 
     // hint
     if (!state.shoe && state.throwsLeft > 0 && !state.aiming) {
@@ -650,6 +852,65 @@
       ctx.fillText("Drag back & release to toss", view.centerX, H - 24);
     }
     ctx.restore();
+  }
+
+  // Small wind readout: an arrow whose length and direction show the drift.
+  function drawWind(x, y) {
+    const w = CONFIG.windMax ? state.wind / CONFIG.windMax : 0; // -1..1
+    ctx.save();
+    ctx.textAlign = "right";
+    ctx.font = "11px sans-serif";
+    ctx.fillStyle = "rgba(255,247,230,0.75)";
+    if (Math.abs(w) < 0.08) {
+      ctx.fillText("wind: calm", x, y);
+    } else {
+      const dir = w > 0 ? "→" : "←";   // right / left arrow
+      const bars = Math.abs(w) > 0.66 ? "###" : Math.abs(w) > 0.33 ? "##" : "#";
+      ctx.fillText("wind " + dir + " " + bars, x, y);
+    }
+    ctx.restore();
+  }
+
+  // Speaker icon in the HUD corner; registers itself as a tappable button.
+  function drawMuteButton() {
+    const size = 34;
+    const bx = W - 10 - size - 6, by = 18;
+    state.buttons.push({
+      x: bx - 4, y: by - 4, w: size + 8, h: size + 8,
+      label: "mute", action: toggleMute,
+    });
+    ctx.save();
+    ctx.translate(bx + size / 2, by + size / 2);
+    ctx.fillStyle = state.muted ? "rgba(255,247,230,0.45)" : COLORS.textLight;
+    // speaker box + cone
+    ctx.beginPath();
+    ctx.moveTo(-8, -3); ctx.lineTo(-3, -3); ctx.lineTo(2, -8);
+    ctx.lineTo(2, 8); ctx.lineTo(-3, 3); ctx.lineTo(-8, 3);
+    ctx.closePath();
+    ctx.fill();
+    if (state.muted) {
+      // slash through it
+      ctx.strokeStyle = "#ff8a80";
+      ctx.lineWidth = 2.5;
+      ctx.beginPath();
+      ctx.moveTo(-9, -9); ctx.lineTo(10, 10);
+      ctx.stroke();
+    } else {
+      // two sound waves
+      ctx.strokeStyle = COLORS.textLight;
+      ctx.lineWidth = 2;
+      for (let i = 1; i <= 2; i++) {
+        ctx.beginPath();
+        ctx.arc(3, 0, 3 + i * 3.5, -Math.PI / 3, Math.PI / 3);
+        ctx.stroke();
+      }
+    }
+    ctx.restore();
+  }
+
+  function toggleMute() {
+    state.muted = !state.muted;
+    if (!state.muted) { sfx.unlock(); sfx.thud(); }
   }
 
   function drawPopups() {
@@ -694,7 +955,7 @@
     ctx.fillText("TOSS", view.centerX, H * 0.3 + Math.min(W * 0.12, 54));
 
     // Decorative horseshoe
-    drawHorseshoe(view.centerX, H * 0.5, 2.2, -0.3, false);
+    drawHorseshoe(view.centerX, H * 0.5, 2.2, -0.3, 1);
 
     ctx.fillStyle = "rgba(255,247,230,0.9)";
     ctx.font = "16px sans-serif";
@@ -741,8 +1002,8 @@
 
   /* ---- Button helpers ---- */
 
+  // Appends buttons for the current screen; render() clears the list each frame.
   function layoutButtons(defs, topY, width) {
-    state.buttons = [];
     const bw = width || Math.min(W * 0.6, 240);
     const bh = 56;
     let y = topY;
@@ -780,6 +1041,7 @@
 
   function startGame() {
     state.screen = SCREEN.GAME;
+    state.round++;
     state.roundScore = 0;
     state.throwsLeft = CONFIG.throwsPerRound;
     state.landedShoes = [];
@@ -788,7 +1050,10 @@
     state.popups = [];
     state.flash = 0;
     state.aiming = false;
+    state.preview = null;
     state.buttons = [];
+    // Fresh wind each round keeps rounds from feeling identical.
+    state.wind = (Math.random() * 2 - 1) * CONFIG.windMax;
   }
 
   /* ============================================================
